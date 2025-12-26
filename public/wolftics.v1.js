@@ -11,7 +11,7 @@
   var BATCH_SIZE = 10;
 
   // ============================================================
-  // EVENT SPEC v1 (NORMALIZADO)
+  // EVENT SPEC (NORMALIZADO)
   // ============================================================
 
   var EVENTS = {
@@ -31,14 +31,6 @@
 
   function nowTs() {
     return Date.now();
-  }
-
-  function assert(condition, message) {
-    if (!condition) {
-      console.warn("[Wolftics][ASSERT]", message);
-      return false;
-    }
-    return true;
   }
 
   function uuid4() {
@@ -63,23 +55,32 @@
     } catch (_) {}
   }
 
+  function assert(condition, message) {
+    if (!condition) {
+      console.warn("[Wolftics][ASSERT]", message);
+      return false;
+    }
+    return true;
+  }
+
   // ============================================================
   // SCRIPT CONFIG
   // ============================================================
 
   var script = document.currentScript;
   if (!script) {
-    console.warn("[Wolftics] Script tag not found");
+    console.warn("[Wolftics] Script tag não encontrado");
     return;
   }
 
   var PROPERTY_KEY = script.getAttribute("data-id");
   if (!PROPERTY_KEY) {
-    console.warn("[Wolftics] data-id (scriptToken) is required");
+    console.warn("[Wolftics] data-id é obrigatório");
     return;
   }
 
   var ENDPOINT = script.getAttribute("data-endpoint") || DEFAULT_ENDPOINT;
+  var AUTO_PAGEVIEW = script.getAttribute("data-auto-pageview") !== "false";
 
   // ============================================================
   // IDENTIDADE
@@ -110,7 +111,7 @@
   var sessionId = ensureSession();
 
   // ============================================================
-  // FILA DE EVENTOS
+  // FILA DE EVENTOS (SEM LOOP)
   // ============================================================
 
   var queue = [];
@@ -118,18 +119,16 @@
 
   function enqueue(evt) {
     if (queue.length >= MAX_QUEUE_SIZE) {
-      console.warn("[Wolftics] Queue limit reached, dropping event");
+      console.warn("[Wolftics] Fila cheia, descartando evento");
       return;
     }
     queue.push(evt);
-    if (!sending) flush();
   }
 
   function flush() {
-    if (!queue.length) return;
+    if (sending || queue.length === 0) return;
 
     sending = true;
-
     var batch = queue.splice(0, BATCH_SIZE);
 
     fetch(ENDPOINT, {
@@ -141,18 +140,11 @@
         batch: batch
       })
     })
-      .then(function (res) {
-        if (!res.ok) {
-          console.warn("[Wolftics] Failed to send events", res.status);
-          queue.unshift.apply(queue, batch);
-        }
-      })
       .catch(function () {
         queue.unshift.apply(queue, batch);
       })
       .finally(function () {
         sending = false;
-        if (queue.length) setTimeout(flush, 200);
       });
   }
 
@@ -161,7 +153,7 @@
   // ============================================================
 
   function buildEvent(type, payload) {
-    if (!assert(ALLOWED_EVENTS.includes(type), "Invalid eventType: " + type)) {
+    if (!assert(ALLOWED_EVENTS.includes(type), "eventType inválido: " + type)) {
       return null;
     }
 
@@ -192,11 +184,16 @@
 
   function track(type, payload) {
     var evt = buildEvent(type, payload);
-    if (evt) enqueue(evt);
+    if (evt) {
+      enqueue(evt);
+      if (queue.length >= BATCH_SIZE) {
+        flush();
+      }
+    }
   }
 
   function identify(userId) {
-    if (!assert(userId, "identify requires userId")) return;
+    if (!assert(userId, "identify requer userId")) return;
     trySetLS(USER_KEY, String(userId));
     track(EVENTS.IDENTIFY, { userId: userId });
   }
@@ -209,7 +206,9 @@
   // AUTO EVENTS
   // ============================================================
 
-  page();
+  if (AUTO_PAGEVIEW) {
+    page();
+  }
 
   document.addEventListener("visibilitychange", function () {
     if (document.visibilityState !== "visible") {
