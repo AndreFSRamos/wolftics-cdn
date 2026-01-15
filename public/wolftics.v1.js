@@ -1,18 +1,14 @@
 (function () {
   "use strict";
 
-  // ============================================================
-  // CONFIGURAÇÕES
-  // ============================================================
-
   var DEFAULT_ENDPOINT = "https://api.wolftics.com/collect";
   var SESSION_TIMEOUT_MINUTES = 30;
-  var MAX_QUEUE_SIZE = 50;
+  var MAX_QUEUE_SIZE = 100;
   var BATCH_SIZE = 10;
-
-  // ============================================================
-  // EVENT SPEC (NORMALIZADO)
-  // ============================================================
+  var HEARTBEAT_SECONDS = 15;
+  var ENABLE_SCROLL_DEPTH = true;
+  var ENABLE_HEARTBEAT = true;
+  var ENABLE_EXIT_EVENT = true;
 
   var EVENTS = {
     PAGE_VIEW: "page_view",
@@ -20,18 +16,17 @@
     ADD_TO_CART: "add_to_cart",
     BEGIN_CHECKOUT: "begin_checkout",
     PURCHASE: "purchase",
-    IDENTIFY: "identify"
+    IDENTIFY: "identify",
+    SCROLL_DEPTH: "scroll_depth",
+    TIME_ON_PAGE: "time_on_page",
+    CTA_CLICK: "cta_click",
+    EXIT_PAGE: "exit_page",
+    CAMPAIGN_VIEW: "campaign_view"
   };
 
   var ALLOWED_EVENTS = Object.values(EVENTS);
 
-  // ============================================================
-  // UTILITÁRIOS
-  // ============================================================
-
-  function nowTs() {
-    return Date.now();
-  }
+  function nowTs() { return Date.now(); }
 
   function uuid4() {
     return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function (c) {
@@ -63,29 +58,38 @@
     return true;
   }
 
-  // ============================================================
-  // SCRIPT CONFIG
-  // ============================================================
+  function safeString(v, maxLen) {
+    try {
+      if (v == null) return null;
+      var s = String(v);
+      if (maxLen && s.length > maxLen) return s.slice(0, maxLen);
+      return s;
+    } catch (_) {
+      return null;
+    }
+  }
 
   var script = document.currentScript;
+
   if (!script) {
-    console.warn("[Wolftics] Script tag não encontrado");
+    var scripts = document.getElementsByTagName("script");
+    script = scripts && scripts.length ? scripts[scripts.length - 1] : null;
+  }
+
+  if (!script) {
+    console.warn("[Wolftics] Script tag not found");
     return;
   }
 
   var PROPERTY_KEY = script.getAttribute("data-id");
   if (!PROPERTY_KEY) {
-    console.warn("[Wolftics] data-id é obrigatório");
+    console.warn("[Wolftics] data-id is required");
     return;
   }
 
   var ENDPOINT = script.getAttribute("data-endpoint") || DEFAULT_ENDPOINT;
   var AUTO_PAGEVIEW = script.getAttribute("data-auto-pageview") !== "false";
-
-  // ============================================================
-  // IDENTIDADE
-  // ============================================================
-
+  var IS_SPA = script.getAttribute("data-spa") === "true";
   var VISITOR_KEY = "wolftics:visitor";
   var SESSION_KEY = "wolftics:session";
   var SESSION_TS_KEY = "wolftics:session_ts";
@@ -110,17 +114,82 @@
 
   var sessionId = ensureSession();
 
-  // ============================================================
-  // FILA DE EVENTOS (SEM LOOP)
-  // ============================================================
+  function getTimezone() {
+    try {
+      return Intl.DateTimeFormat().resolvedOptions().timeZone || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function getDeviceType() {
+    try {
+      var w = Math.min(window.screen.width, window.screen.height);
+      if (w <= 767) return "mobile";
+      if (w <= 1024) return "tablet";
+      return "desktop";
+    } catch (_) {
+      return "desktop";
+    }
+  }
+
+  function extractUTMs() {
+    try {
+      var params = new URLSearchParams(location.search);
+      return {
+        source: params.get("utm_source"),
+        medium: params.get("utm_medium"),
+        campaign: params.get("utm_campaign"),
+        term: params.get("utm_term"),
+        content: params.get("utm_content")
+      };
+    } catch (_) {
+      return { source: null, medium: null, campaign: null, term: null, content: null };
+    }
+  }
+
+  function hasAnyUtm(c) {
+    return !!(c && (c.source || c.medium || c.campaign || c.term || c.content));
+  }
+
+  function buildContext() {
+    var campaign = extractUTMs();
+
+    return {
+      url: safeString(location.href, 2048),
+      path: safeString(location.pathname, 512),
+      referrer: safeString(document.referrer || null, 2048),
+      title: safeString(document.title || null, 256),
+      language: safeString(navigator.language || null, 32),
+      timezone: safeString(getTimezone(), 64),
+      screen: {
+        w: window.screen && window.screen.width ? window.screen.width : null,
+        h: window.screen && window.screen.height ? window.screen.height : null
+      },
+      device: {
+        type: getDeviceType(),
+        platform: safeString(navigator.platform || null, 64)
+      },
+      page: {
+        isSpa: !!IS_SPA,
+        route: null
+      },
+      campaign: {
+        source: safeString(campaign.source, 128),
+        medium: safeString(campaign.medium, 128),
+        campaign: safeString(campaign.campaign, 256),
+        term: safeString(campaign.term, 256),
+        content: safeString(campaign.content, 256)
+      }
+    };
+  }
 
   var queue = [];
   var sending = false;
 
   function enqueue(evt) {
     if (queue.length >= MAX_QUEUE_SIZE) {
-      console.warn("[Wolftics] Fila cheia, descartando evento");
-      return;
+      queue.shift();
     }
     queue.push(evt);
   }
@@ -141,34 +210,27 @@
       })
     })
       .catch(function () {
-        queue.unshift.apply(queue, batch);
+        try {
+          queue.unshift.apply(queue, batch);
+        } catch (_) {}
       })
       .finally(function () {
         sending = false;
       });
   }
 
-  // ============================================================
-  // CONSTRUÇÃO DE EVENTO
-  // ============================================================
-
   function buildEvent(type, payload) {
-    if (!assert(ALLOWED_EVENTS.includes(type), "eventType inválido: " + type)) {
+    if (!assert(ALLOWED_EVENTS.includes(type), "Invalid eventType: " + type)) {
       return null;
     }
 
     sessionId = ensureSession();
 
     return {
+      eventId: uuid4(),
       eventType: type,
       payload: payload || {},
-      context: {
-        url: location.href,
-        path: location.pathname,
-        referrer: document.referrer || null,
-        language: navigator.language || null,
-        userAgent: navigator.userAgent || null
-      },
+      context: buildContext(),
       identity: {
         visitorId: visitorId,
         sessionId: sessionId,
@@ -178,52 +240,147 @@
     };
   }
 
-  // ============================================================
-  // API PÚBLICA
-  // ============================================================
-
   function track(type, payload) {
     var evt = buildEvent(type, payload);
-    if (evt) {
-      enqueue(evt);
-      if (queue.length >= BATCH_SIZE) {
-        flush();
-      }
+    if (!evt) return;
+
+    enqueue(evt);
+    if (queue.length >= BATCH_SIZE) {
+      flush();
     }
   }
 
-  function identify(userId) {
-    if (!assert(userId, "identify requer userId")) return;
+  function identify(userId, meta) {
+    if (!assert(userId, "identify requires userId")) return;
+
     trySetLS(USER_KEY, String(userId));
-    track(EVENTS.IDENTIFY, { userId: userId });
+
+    var payload = { userId: String(userId) };
+    if (meta && typeof meta === "object") {
+      if (meta.email) payload.email = safeString(meta.email, 150);
+      if (meta.phone) payload.phone = safeString(meta.phone, 50);
+    }
+
+    track(EVENTS.IDENTIFY, payload);
   }
 
-  function page() {
-    track(EVENTS.PAGE_VIEW);
+  function page(route) {
+    var evt = buildEvent(EVENTS.PAGE_VIEW, {});
+    if (!evt) return;
+
+    if (route) {
+      evt.context.page.route = safeString(route, 512);
+    }
+    enqueue(evt);
+
+    if (hasAnyUtm(evt.context.campaign)) {
+      track(EVENTS.CAMPAIGN_VIEW, {});
+    }
+
+    if (queue.length >= BATCH_SIZE) flush();
   }
 
-  // ============================================================
-  // AUTO EVENTS
-  // ============================================================
 
-  if (AUTO_PAGEVIEW) {
-    page();
+  if (AUTO_PAGEVIEW) { page(null); }
+
+  var sentScrollPercents = {};
+  function handleScrollDepth() {
+    if (!ENABLE_SCROLL_DEPTH) return;
+
+    try {
+      var doc = document.documentElement || document.body;
+      var scrollTop = window.pageYOffset || doc.scrollTop || 0;
+      var scrollHeight = doc.scrollHeight || 1;
+      var clientHeight = doc.clientHeight || window.innerHeight || 1;
+
+      var total = Math.max(scrollHeight - clientHeight, 1);
+      var pct = Math.floor((scrollTop / total) * 100);
+
+      var thresholds = [25, 50, 75, 100];
+      for (var i = 0; i < thresholds.length; i++) {
+        var t = thresholds[i];
+        if (pct >= t && !sentScrollPercents[t]) {
+          sentScrollPercents[t] = true;
+          track(EVENTS.SCROLL_DEPTH, { percent: t });
+        }
+      }
+    } catch (_) {}
+  }
+
+  if (ENABLE_SCROLL_DEPTH) {
+    window.addEventListener("scroll", handleScrollDepth, { passive: true });
+  }
+
+  document.addEventListener("click", function (e) {
+    try {
+      var el = e.target;
+      while (el && el !== document.documentElement) {
+        if (el.getAttribute && el.getAttribute("data-wolf-cta")) {
+          var ctaId = el.getAttribute("data-wolf-cta");
+          var text = el.textContent ? el.textContent.trim() : null;
+          var href = el.getAttribute("href") || null;
+
+          track(EVENTS.CTA_CLICK, {
+            ctaId: safeString(ctaId, 128),
+            text: safeString(text, 120),
+            href: safeString(href, 512)
+          });
+          break;
+        }
+        el = el.parentNode;
+      }
+    } catch (_) {}
+  });
+
+  var pageStartTs = nowTs();
+  var lastHeartbeatSeconds = 0;
+
+  function heartbeat() {
+    if (!ENABLE_HEARTBEAT) return;
+
+    var elapsed = Math.floor((nowTs() - pageStartTs) / 1000);
+    if (elapsed <= 0) return;
+
+    if (elapsed - lastHeartbeatSeconds >= HEARTBEAT_SECONDS) {
+      lastHeartbeatSeconds = elapsed;
+      track(EVENTS.TIME_ON_PAGE, { seconds: elapsed });
+    }
+  }
+
+  var heartbeatTimer = null;
+  if (ENABLE_HEARTBEAT) {
+    heartbeatTimer = setInterval(heartbeat, 1000);
+  }
+
+  function onExit(reason) {
+    try {
+      if (ENABLE_EXIT_EVENT) {
+        var elapsed = Math.floor((nowTs() - pageStartTs) / 1000);
+        if (elapsed > 0) {
+          track(EVENTS.TIME_ON_PAGE, { seconds: elapsed });
+        }
+        track(EVENTS.EXIT_PAGE, { reason: reason || "unload" });
+      }
+    } catch (_) {}
+
+    flush();
   }
 
   document.addEventListener("visibilitychange", function () {
     if (document.visibilityState !== "visible") {
-      flush();
+      onExit("hidden");
     }
   });
 
-  // ============================================================
-  // EXPOSIÇÃO GLOBAL
-  // ============================================================
+  window.addEventListener("beforeunload", function () {
+    onExit("unload");
+  });
 
   window.wolftics = {
     track: track,
     page: page,
     identify: identify,
-    events: EVENTS
+    events: EVENTS,
+    flush: flush
   };
 })();
