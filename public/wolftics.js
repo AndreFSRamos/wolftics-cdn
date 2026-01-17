@@ -250,10 +250,20 @@
     });
   }
 
+  function isSameOriginEndpoint(url) {
+    try {
+      return new URL(url, location.href).origin === location.origin;
+    } catch (_) {
+      return false;
+    }
+  }
+
   function flush(options) {
     options = options || {};
     var force = !!options.force;
     var useBeacon = !!options.beacon;
+
+    if (useBeacon && !isSameOriginEndpoint(ENDPOINT)) { useBeacon = false; }
 
     if (sending) return;
     if (queue.length === 0) {
@@ -296,6 +306,8 @@
 
     fetchWithTimeout(ENDPOINT, {
       method: "POST",
+      mode: "cors",
+      credentials: "omit",
       headers: { "Content-Type": "application/json" },
       keepalive: true,
       body: payload
