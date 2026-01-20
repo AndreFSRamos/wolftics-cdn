@@ -427,7 +427,66 @@
     track(EVENTS.IDENTIFY, payload);
   }
 
+  // ---- SPA Auto-tracking helpers (added) ----
+  var sentScrollPercents = {};
+  var pageStartTs = nowTs();
+  var lastHeartbeatSeconds = 0;
+
+  function resetPageTracking() {
+    pageStartTs = nowTs();
+    lastHeartbeatSeconds = 0;
+    sentScrollPercents = {};
+  }
+
+  function getSpaRouteKey() {
+    try {
+      return safeString(location.pathname, 512) || "/";
+    } catch (_) {
+      return "/";
+    }
+  }
+
+  function installSpaAutoTracking() {
+    var lastRoute = getSpaRouteKey();
+
+    function onRouteMaybeChanged() {
+      var current = getSpaRouteKey();
+      if (!current) return;
+      if (current === lastRoute) return;
+      lastRoute = current;
+      page(current);
+    }
+
+    try {
+      var _pushState = history.pushState;
+      history.pushState = function () {
+        var ret = _pushState.apply(this, arguments);
+        try { onRouteMaybeChanged(); } catch (_) {}
+        return ret;
+      };
+
+      var _replaceState = history.replaceState;
+      history.replaceState = function () {
+        var ret = _replaceState.apply(this, arguments);
+        try { onRouteMaybeChanged(); } catch (_) {}
+        return ret;
+      };
+    } catch (_) {}
+
+    window.addEventListener("popstate", function () {
+      try { onRouteMaybeChanged(); } catch (_) {}
+    });
+
+    // Initial page view with route filled
+    if (AUTO_PAGEVIEW) {
+      page(lastRoute);
+    }
+  }
+  // ---- end SPA Auto-tracking helpers ----
+
   function page(route) {
+    resetPageTracking();
+
     var evt = buildEvent(EVENTS.PAGE_VIEW, {});
     if (!evt) return;
 
@@ -439,9 +498,13 @@
     if (queue.length >= BATCH_SIZE) flush({ force: true });
   }
 
-  if (AUTO_PAGEVIEW) page(null);
+  // Page view bootstrap: SPA vs non-SPA
+  if (IS_SPA) {
+    installSpaAutoTracking();
+  } else {
+    if (AUTO_PAGEVIEW) page(null);
+  }
 
-  var sentScrollPercents = {};
   function handleScrollDepth() {
     if (!ENABLE_SCROLL_DEPTH) return;
 
@@ -489,9 +552,6 @@
       }
     } catch (_) {}
   });
-
-  var pageStartTs = nowTs();
-  var lastHeartbeatSeconds = 0;
 
   function heartbeat() {
     if (!ENABLE_HEARTBEAT) return;
